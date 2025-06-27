@@ -1,4 +1,6 @@
-# CREADO POR GEMINI Y v0 CON AYUDA DE KEISEV
+# CREADO POR IAs "Gemini 2.5 Pro", "v0-1.5-md", "DeepSeek R1" Y "ChatGPT o-4-mini" CON SUPERVISIÓN DE KEISEV
+# EL CÓDIGO v3.5 FUE TESTEADO, REVISADO Y MEJORADO POR LA IA "v0-1.5-md" CON SUPERVISIÓN DE KEISEV PARA CREAR LA v3.6
+# VERSIÓN v3.6 - MEJORAS ADICIONALES IMPLEMENTADAS
 
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
@@ -7,32 +9,24 @@ import os
 import json
 import glob
 import re
+from urllib.parse import urlparse
 import shutil
 import threading
 import signal
-
-# --- CHANGELOG ---
-
-# v3.5.1
-# - Ahora todos los videos se descargarán en códec h.264 (avc)
-
-# v3.5
-# - Corregido error al insertar subtítulos desde un archivo local: El programa ya no validará el idioma de los subtítulos si se selecciona un archivo local.
-# - El programa ya no elimina todos los archivos .srt en el directorio del script
-# - Eliminado código duplicado y redundante.
+import logging
+from datetime import datetime
+from contextlib import contextmanager
 
 class YT_DLP_GUI(ctk.CTk):
     def __init__(self):
         super().__init__()
-
         self.local_srt_path = None
         self.current_process = None
 
         # --- CONFIGURACIÓN DE LA VENTANA PRINCIPAL ---
-        self.title("Simple YT-DLP GUI v3.5.1")
+        self.title("Simple YT-DLP GUI v3.6")
         self.geometry("1100x680")
         self.resizable(True, True)
-
         ctk.set_appearance_mode("dark")
 
         # --- Colores de la interfaz ---
@@ -50,7 +44,6 @@ class YT_DLP_GUI(ctk.CTk):
         self.COLOR_LOG_WARNING = "#FFD700"
         self.COLOR_LOG_SUCCESS = "#32CD32"
         self.COLOR_LOG_DEFAULT = "lightgray"
-
         self.configure(fg_color=self.COLOR_MAIN_BG)
 
         # --- VARIABLES DE ESTADO ---
@@ -62,19 +55,173 @@ class YT_DLP_GUI(ctk.CTk):
         # --- VARIABLES PARA OPCIONES DE SUBTÍTULOS ---
         self.burn_subtitles = ctk.BooleanVar(value=True)
         self.embed_subtitles = ctk.BooleanVar(value=False)
-
+        
         # Lista de idiomas para la generación de subtítulos automáticos.
         self.AUTOMATIC_SUB_LANGUAGES = ['es', 'en', 'ja', 'pt', 'fr', 'de', 'it', 'ko', 'ru', 'zh-Hans']
+
+        # --- CONFIGURAR LOGGING MEJORADO ---
+        self.setup_logging()
+
+        # --- VERIFICAR DEPENDENCIAS AL INICIO ---
+        self.dependencies_ok = False
 
         # --- INICIALIZAR LA INTERFAZ DE USUARIO ---
         self._create_widgets()
 
         # --- Variable para manejar el archivo de configuración y guardar la ruta ---
         self.config_file = "simpleytdlp_config.json"
-        self.last_output_dir = "" # Guardará la ruta del config
+        self.last_output_dir = ""
         self._load_config()
 
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        # --- VERIFICAR DEPENDENCIAS DESPUÉS DE CREAR LA UI ---
+        self.after(500, self.check_dependencies_delayed)
+
+    def setup_logging(self):
+        """Configura logging estructurado"""
+        log_format = '%(asctime)s - %(levelname)s - %(message)s'
+        logging.basicConfig(
+            level=logging.INFO,
+            format=log_format,
+            handlers=[
+                logging.FileHandler('yt_dlp_gui.log', encoding='utf-8'),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+
+    def validate_youtube_url(self, url):
+        """Valida si la URL es de YouTube válida"""
+        if not url:
+            return False
+            
+        youtube_patterns = [
+            r'(?:https?://)?(?:www\.)?youtube\.com/watch\?v=[\w-]+',
+            r'(?:https?://)?(?:www\.)?youtu\.be/[\w-]+',
+            r'(?:https?://)?(?:www\.)?youtube\.com/embed/[\w-]+',
+            r'(?:https?://)?(?:www\.)?youtube\.com/shorts/[\w-]+',
+        ]
+        
+        return any(re.match(pattern, url, re.IGNORECASE) for pattern in youtube_patterns)
+
+    def sanitize_filename(self, filename):
+        """Sanitiza nombres de archivo para múltiples plataformas"""
+        if not filename:
+            return "video_sin_titulo"
+            
+        # Caracteres prohibidos en Windows y otros sistemas
+        forbidden_chars = r'[<>:"/\\|?*]'
+        # Reemplazar caracteres prohibidos
+        sanitized = re.sub(forbidden_chars, '_', filename)
+        # Remover espacios al inicio y final
+        sanitized = sanitized.strip()
+        # Remover puntos al final (problemático en Windows)
+        sanitized = sanitized.rstrip('.')
+        # Limitar longitud (255 caracteres es el límite en la mayoría de sistemas)
+        if len(sanitized) > 200:  # Dejar espacio para extensión
+            sanitized = sanitized[:200]
+        # Asegurar que no esté vacío
+        if not sanitized:
+            sanitized = "video_sin_titulo"
+        return sanitized
+
+    @contextmanager
+    def managed_process(self, command):
+        """Context manager para manejo seguro de procesos"""
+        process = None
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                startupinfo=self._get_startup_info()
+            )
+            self.current_process = process
+            yield process
+        finally:
+            if process and process.poll() is None:
+                try:
+                    process.terminate()
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    self.log_message("Proceso forzado a terminar", "warning")
+            self.current_process = None
+
+    def check_dependencies_delayed(self):
+        """Verifica dependencias después de que la UI esté lista"""
+        thread = threading.Thread(target=self.check_dependencies, daemon=True)
+        thread.start()
+
+    def check_dependencies(self):
+        """Verifica que las dependencias estén instaladas"""
+        self.log_message("Verificando dependencias...", "info")
+        
+        dependencies = {
+            'yt-dlp': ['yt-dlp', '--version'],
+            'ffmpeg': ['ffmpeg', '-version']
+        }
+        
+        missing_deps = []
+        for name, command in dependencies.items():
+            try:
+                result = subprocess.run(
+                    command, 
+                    capture_output=True, 
+                    check=True, 
+                    timeout=10,
+                    startupinfo=self._get_startup_info()
+                )
+                self.log_message(f"✓ {name} encontrado", "success")
+            except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+                missing_deps.append(name)
+                self.log_message(f"✗ {name} no encontrado", "error")
+        
+        if missing_deps:
+            error_msg = f"Dependencias faltantes: {', '.join(missing_deps)}"
+            self.log_message(error_msg, "error")
+            self.log_message("Por favor instala las dependencias antes de continuar.", "error")
+            
+            # Mostrar mensaje en la UI thread
+            def show_error():
+                messagebox.showerror(
+                    "Dependencias faltantes", 
+                    f"{error_msg}\n\nPor favor instala las dependencias antes de continuar.\n\n"
+                    f"yt-dlp: pip install yt-dlp\n"
+                    f"ffmpeg: Descarga desde https://ffmpeg.org/"
+                )
+            
+            if self.winfo_exists():
+                self.after(0, show_error)
+            
+            self.dependencies_ok = False
+        else:
+            self.log_message("Todas las dependencias están disponibles", "success")
+            self.dependencies_ok = True
+
+    def log_message(self, message, level="info"):
+        """Versión mejorada del logging con timestamps y archivo"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        formatted_message = f"[{timestamp}] {message}"
+        
+        # Log a archivo
+        if hasattr(self, 'logger'):
+            log_method = getattr(self.logger, level.lower(), self.logger.info)
+            log_method(message)
+        
+        # Log a UI
+        def _log():
+            if hasattr(self, 'activity_log') and self.activity_log.winfo_exists():
+                tag = level.lower() if level.lower() in ["info", "error", "warning", "success"] else None
+                self.activity_log.insert("end", formatted_message + "\n", tag)
+                self.activity_log.see("end")
+        
+        if self.winfo_exists():
+            self.after(0, _log)
 
     def _create_widgets(self):
         # --- Contenedor principal ---
@@ -94,33 +241,27 @@ class YT_DLP_GUI(ctk.CTk):
 
         # --- TÍTULO DE LA APLICACIÓN ---
         self._create_title_section(left_panel)
-
         # --- SECCIÓN: VIDEO PRINCIPAL ---
         self._create_video_section(left_panel)
-
         # --- SECCIÓN: FUENTE DE AUDIO ---
         self._create_audio_section(left_panel)
-        
         # --- SECCIÓN: SUBTÍTULOS ---
         self._create_subtitles_section(left_panel)
-
         # --- SECCIÓN: DIRECTORIO DE SALIDA ---
         self._create_output_section(left_panel)
-
         # --- BOTONES DE ACCIÓN ---
         self._create_action_buttons(left_panel)
-
         # --- SECCIÓN: REGISTRO DE ACTIVIDAD (Panel derecho) ---
         self._create_log_section(right_panel)
         
         self.update_subtitle_type_ui()
-        self.log_message("Listo para empezar. Introduce una URL y haz clic en 'Obtener Info'.", "info")
+        self.log_message("Aplicación iniciada. Verificando dependencias...", "info")
 
     def _create_title_section(self, parent):
         """Crea la sección del título de la aplicación"""
         title_frame = ctk.CTkFrame(parent, fg_color="transparent")
         title_frame.pack(fill="x", pady=(0, 20))
-        ctk.CTkLabel(title_frame, text="Simple YT-DLP GUI", font=ctk.CTkFont(size=24, weight="bold")).pack(anchor="w")
+        ctk.CTkLabel(title_frame, text="Simple YT-DLP GUI v3.6", font=ctk.CTkFont(size=24, weight="bold")).pack(anchor="w")
         ctk.CTkLabel(title_frame, text="Aplicación de escritorio para descargas avanzadas de YouTube con múltiples opciones para subtítulos. Salida siempre en .mp4", font=ctk.CTkFont(size=12)).pack(anchor="w")
 
     def _create_video_section(self, parent):
@@ -130,7 +271,6 @@ class YT_DLP_GUI(ctk.CTk):
         
         self.url_entry = ctk.CTkEntry(video_frame, placeholder_text="https://youtu.be/...", fg_color=self.COLOR_ENTRY_BG, height=35)
         self.url_entry.pack(fill="x", padx=10, pady=(5, 10), expand=True)
-
         self.info_button = ctk.CTkButton(video_frame, text="Obtener Info", command=self.fetch_video_info_thread)
         self.info_button.pack(anchor="e", padx=10, pady=(0, 10))
 
@@ -139,26 +279,29 @@ class YT_DLP_GUI(ctk.CTk):
         audio_frame = self._create_section_frame(parent, "Fuente de Audio")
         audio_frame.grid_columnconfigure(0, weight=1)
 
-        self.audio_orig_radio = ctk.CTkRadioButton(audio_frame, text="Usar audio del video original", variable=self.audio_source, value="original", command=self.on_audio_source_change)
+        self.audio_orig_radio = ctk.CTkRadioButton(audio_frame, text="Usar audio del video original",
+                                                   variable=self.audio_source, value="original",
+                                                   command=self.on_audio_source_change)
         self.audio_orig_radio.grid(row=0, column=0, sticky="w", padx=10, pady=(10,5))
         
-        self.audio_ext_radio = ctk.CTkRadioButton(audio_frame, text="Usar audio de otro video", variable=self.audio_source, value="external", command=self.on_audio_source_change)
+        self.audio_ext_radio = ctk.CTkRadioButton(audio_frame, text="Usar audio de otro video", 
+                                                  variable=self.audio_source, value="external", 
+                                                  command=self.on_audio_source_change)
         self.audio_ext_radio.grid(row=1, column=0, sticky="w", padx=10, pady=(5,10))
         
-        self.audio_url_entry = ctk.CTkEntry(audio_frame, placeholder_text="URL del video para el audio", fg_color=self.COLOR_ENTRY_BG)
+        self.audio_url_entry = ctk.CTkEntry(audio_frame, placeholder_text="URL del video para el audio", 
+                                            fg_color=self.COLOR_ENTRY_BG)
 
     def _create_subtitles_section(self, parent):
-        """CORRECCIÓN DEFINITIVA: Crea la sección de subtítulos con separación clara de widgets"""
+        """Crea la sección de subtítulos con separación clara de widgets"""
         subs_frame = self._create_section_frame(parent, "Subtítulos")
         subs_frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
         
         # Botones de tipo de subtítulo
         self.sub_none_btn = self._create_toggle_button(subs_frame, text="Sin subtítulos", value="none")
         self.sub_none_btn.grid(row=0, column=0, padx=5, pady=10, sticky="ew")
-
         self.sub_internal_btn = self._create_toggle_button(subs_frame, text="Internos", value="internal")
         self.sub_internal_btn.grid(row=0, column=1, padx=5, pady=10, sticky="ew")
-
         self.sub_external_btn = self._create_toggle_button(subs_frame, text="Externos", value="external")
         self.sub_external_btn.grid(row=0, column=2, padx=5, pady=10, sticky="ew")
         
@@ -177,17 +320,17 @@ class YT_DLP_GUI(ctk.CTk):
         self.embed_subs_checkbox = ctk.CTkCheckBox(self.sub_processing_frame, text="Insertar Subtítulos", 
                                                    variable=self.embed_subtitles, command=self._on_subtitle_option_change)
 
-        # CORRECCIÓN: Menú de idiomas INDEPENDIENTE para internos/automáticos
+        # Menú de idiomas INDEPENDIENTE para internos/automáticos
         self.sub_lang_menu_standalone = ctk.CTkOptionMenu(self.sub_options_container, values=["-"], state="disabled")
 
         # Campo de URL externa (solo para externos)
         self.sub_external_url_entry = ctk.CTkEntry(self.sub_options_container, placeholder_text="URL para subtítulos", fg_color=self.COLOR_ENTRY_BG)
 
-        # CORRECCIÓN: Marco SOLO para externos con distribución original
+        # Marco SOLO para externos con distribución original
         self.sub_menu_button_frame = ctk.CTkFrame(self.sub_options_container, fg_color="transparent")
-        self.sub_menu_button_frame.grid_columnconfigure(0, weight=50)  # Menú más espacio (ORIGINAL)
-        self.sub_menu_button_frame.grid_columnconfigure(1, weight=2)   # Botón archivo (ORIGINAL)
-        self.sub_menu_button_frame.grid_columnconfigure(2, weight=1)   # Botón info (ORIGINAL)
+        self.sub_menu_button_frame.grid_columnconfigure(0, weight=50)  # Menú más espacio
+        self.sub_menu_button_frame.grid_columnconfigure(1, weight=2)   # Botón archivo
+        self.sub_menu_button_frame.grid_columnconfigure(2, weight=1)   # Botón info
 
         # Widgets SOLO para externos
         self.sub_lang_menu_external = ctk.CTkOptionMenu(self.sub_menu_button_frame, values=["-"], state="disabled")
@@ -201,6 +344,7 @@ class YT_DLP_GUI(ctk.CTk):
         
         self.dir_entry = ctk.CTkEntry(output_dir_frame, fg_color=self.COLOR_ENTRY_BG, height=35)
         self.dir_entry.grid(row=0, column=0, padx=(10, 5), pady=10, sticky="ew")
+
         def set_initial_dir():
             # 1. Usar la ruta guardada si es válida
             if self.last_output_dir and os.path.isdir(self.last_output_dir):
@@ -213,7 +357,6 @@ class YT_DLP_GUI(ctk.CTk):
                 self.dir_entry.insert(0, default_path)
         
         self.after(100, set_initial_dir)
-
         self.browse_button = ctk.CTkButton(output_dir_frame, text="Cambiar", width=80, command=self.browse_directory)
         self.browse_button.grid(row=0, column=1, padx=(0, 10), pady=10)
 
@@ -324,16 +467,6 @@ class YT_DLP_GUI(ctk.CTk):
         if self.is_downloading:
             self.set_ui_state(False)
 
-    def log_message(self, message, level="default"):
-        """Registra un mensaje en el log con el nivel especificado"""
-        def _log():
-            if self.activity_log.winfo_exists():
-                tag = level.lower() if level.lower() in ["info", "error", "warning", "success"] else None
-                self.activity_log.insert("end", message + "\n", tag)
-                self.activity_log.see("end")
-        if self.winfo_exists():
-            self.after(0, _log)
-
     def browse_directory(self):
         """Abre el diálogo para seleccionar directorio de salida"""
         dir_path = filedialog.askdirectory(initialdir=self.dir_entry.get())
@@ -354,7 +487,7 @@ class YT_DLP_GUI(ctk.CTk):
         self.update_subtitle_type_ui()
 
     def update_subtitle_type_ui(self):
-        """CORRECCIÓN DEFINITIVA: Separación completa de widgets por tipo"""
+        """Separación completa de widgets por tipo"""
         
         # PASO 1: Ocultar COMPLETAMENTE el contenedor de opciones
         self.sub_options_container.grid_forget()
@@ -384,7 +517,7 @@ class YT_DLP_GUI(ctk.CTk):
             self.embed_subs_checkbox.grid(row=0, column=1, padx=5, pady=5, sticky="w")
             
             if sub_type in ["internal", "automatic"]:
-                # CORRECCIÓN: Solo menú standalone, SIN frame de botones
+                # Solo menú standalone, SIN frame de botones
                 self.sub_lang_menu_standalone.pack(fill="x", pady=(0, 10))
                 
                 if sub_type == "internal":
@@ -395,7 +528,7 @@ class YT_DLP_GUI(ctk.CTk):
                         self.sub_lang_menu_standalone.set(self.AUTOMATIC_SUB_LANGUAGES[0])
                         
             elif sub_type == "external":
-                # CORRECCIÓN: Usar frame CON botones, distribución original
+                # Usar frame CON botones, distribución original
                 self.sub_external_url_entry.pack(fill="x", pady=(0, 10))
                 self.sub_menu_button_frame.pack(fill="x", expand=True, pady=(0, 10))
                 
@@ -417,7 +550,7 @@ class YT_DLP_GUI(ctk.CTk):
                     self.sub_fetch_button.configure(state="normal")
 
     def update_internal_subs_menu(self):
-        """CORRECCIÓN: Actualiza el menú standalone para internos"""
+        """Actualiza el menú standalone para internos"""
         if not self.video_info:
             self.log_message("ERROR: Primero obtén la información del video principal.", "error")
             self.sub_lang_menu_standalone.configure(values=["-Sin Info-"], state="disabled")
@@ -455,10 +588,22 @@ class YT_DLP_GUI(ctk.CTk):
 
     def fetch_video_info_thread(self):
         """Inicia un hilo para obtener información del video"""
-        url = self.url_entry.get()
+        url = self.url_entry.get().strip()
+        
         if not url:
             self.log_message("ERROR: Por favor, introduce una URL de video.", "error")
             return
+            
+        # Validar URL de YouTube
+        if not self.validate_youtube_url(url):
+            self.log_message("ERROR: La URL no parece ser de YouTube válida.", "error")
+            return
+            
+        # Verificar dependencias
+        if not self.dependencies_ok:
+            self.log_message("ERROR: Las dependencias no están disponibles. Verifica que yt-dlp esté instalado.", "error")
+            return
+            
         self.log_message(f"Obteniendo información de: {url}...", "info")
         self.set_ui_state(True)
         thread = threading.Thread(target=self.get_video_info, args=(url,), daemon=True)
@@ -469,6 +614,12 @@ class YT_DLP_GUI(ctk.CTk):
         if self.is_downloading:
             self.log_message("ERROR: Ya hay una descarga en progreso.", "error")
             return
+            
+        # Verificar dependencias
+        if not self.dependencies_ok:
+            self.log_message("ERROR: Las dependencias no están disponibles. Verifica que yt-dlp y ffmpeg estén instalados.", "error")
+            return
+            
         try:
             params = self._gather_download_parameters()
         except ValueError as e:
@@ -479,32 +630,36 @@ class YT_DLP_GUI(ctk.CTk):
         self.set_ui_state(True)
         thread = threading.Thread(target=self.download_and_process_video, args=params, daemon=True)
         thread.start()
-  
+
     def _gather_download_parameters(self):
-        """CORRECCIÓN: Recopila parámetros diferenciando entre archivo local y URL"""
-        video_url = self.url_entry.get()
+        """Recopila parámetros diferenciando entre archivo local y URL"""
+        video_url = self.url_entry.get().strip()
         if not video_url or not self.video_info: 
             raise ValueError("Obtén la información del video principal antes de descargar.")
         
+        # Validar URL principal
+        if not self.validate_youtube_url(video_url):
+            raise ValueError("La URL del video principal no es válida.")
+        
         # Información de audio
         audio_type_val = self.audio_source.get()
-        audio_url_val = self.audio_url_entry.get() if audio_type_val == "external" else video_url
-        if audio_type_val == "external" and not audio_url_val: 
-            raise ValueError("Debes proporcionar un URL para el audio externo.")
+        audio_url_val = self.audio_url_entry.get().strip() if audio_type_val == "external" else video_url
+        if audio_type_val == "external":
+            if not audio_url_val:
+                raise ValueError("Debes proporcionar un URL para el audio externo.")
+            if not self.validate_youtube_url(audio_url_val):
+                raise ValueError("La URL del audio externo no es válida.")
         audio_info = (audio_type_val.upper(), audio_url_val)
         
         # Información de subtítulos
         sub_type_val = "NONE"
         sub_lang_val = None
         sub_url_source_val = video_url # Por defecto es la URL principal
-
         if self.subtitle_type.get() != "none":
             sub_type_val = self.subtitle_type.get().upper()
             
             # CASO 1: Subtítulos externos DESDE ARCHIVO
             if self.subtitle_type.get() == "external" and self.local_srt_path:
-                # Si hay un archivo local, el "idioma" es el nombre del archivo y no hay URL.
-                # La validación de idioma no es necesaria.
                 sub_lang_val = os.path.basename(self.local_srt_path)
                 sub_url_source_val = None # No hay URL de origen
             
@@ -521,12 +676,14 @@ class YT_DLP_GUI(ctk.CTk):
                 
                 # Validar que haya un URL si es externo
                 if self.subtitle_type.get() == "external":
-                    sub_url_source_val = self.sub_external_url_entry.get()
+                    sub_url_source_val = self.sub_external_url_entry.get().strip()
                     if not sub_url_source_val: 
                         raise ValueError("Debes proporcionar un URL para los subtítulos externos.")
+                    if not self.validate_youtube_url(sub_url_source_val):
+                        raise ValueError("La URL de subtítulos externos no es válida.")
         
         sub_info = (sub_type_val, sub_lang_val, sub_url_source_val)
-        
+      
         # Opciones de procesamiento de subtítulos
         subtitle_options = {
             'burn': self.burn_subtitles.get(),
@@ -534,29 +691,13 @@ class YT_DLP_GUI(ctk.CTk):
         }
         
         # Directorio de salida y nombre de archivo
-        output_dir = self.dir_entry.get()
+        output_dir = self.dir_entry.get().strip()
         if not output_dir: 
             raise ValueError("El directorio de salida no puede estar vacío.")
         os.makedirs(output_dir, exist_ok=True)
         
         video_title = self.video_info.get("title", "video_sin_titulo")
-        sanitized_title = re.sub(r'[\\/*?:"<>|]', "", video_title).strip() + ".mp4"
-        final_filename = os.path.join(output_dir, sanitized_title)
-        
-        # Opciones de procesamiento de subtítulos
-        subtitle_options = {
-            'burn': self.burn_subtitles.get(),
-            'embed': self.embed_subtitles.get()
-        }
-        
-        # Directorio de salida y nombre de archivo
-        output_dir = self.dir_entry.get()
-        if not output_dir: 
-            raise ValueError("El directorio de salida no puede estar vacío.")
-        os.makedirs(output_dir, exist_ok=True)
-        
-        video_title = self.video_info.get("title", "video_sin_titulo")
-        sanitized_title = re.sub(r'[\\/*?:"<>|]', "", video_title).strip() + ".mp4"
+        sanitized_title = self.sanitize_filename(video_title) + ".mp4"
         final_filename = os.path.join(output_dir, sanitized_title)
         
         font = self.select_font(video_title)
@@ -564,17 +705,33 @@ class YT_DLP_GUI(ctk.CTk):
         return video_url, audio_info, sub_info, subtitle_options, font, final_filename
 
     def get_video_info(self, url):
-        """Obtiene información del video usando yt-dlp"""
+        """Obtiene información del video usando yt-dlp con mejor manejo de errores"""
         try:
             command = ["yt-dlp", "--dump-json", url]
-            self.current_process = subprocess.run(command, capture_output=True, text=True, check=True, 
-                                                encoding='utf-8', startupinfo=self._get_startup_info())
+            self.current_process = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=True,
+                encoding='utf-8',
+                startupinfo=self._get_startup_info(),
+                timeout=30
+            )
             self.video_info = json.loads(self.current_process.stdout)
             self.log_message(f"Información obtenida para: {self.video_info.get('title', 'Título desconocido')}", "success")
             if self.winfo_exists(): 
                 self.after(0, self.update_internal_subs_menu)
+        except subprocess.TimeoutExpired:
+            self.log_message("Error: Tiempo de espera agotado al obtener información del video", "error")
+            self.video_info = None
+        except subprocess.CalledProcessError as e:
+            self.log_message(f"Error en yt-dlp: {e.stderr if e.stderr else str(e)}", "error")
+            self.video_info = None
+        except json.JSONDecodeError as e:
+            self.log_message(f"Error al parsear información del video: {e}", "error")
+            self.video_info = None
         except Exception as e:
-            self.log_message(f"Error al obtener información del video: {e}", "error")
+            self.log_message(f"Error inesperado al obtener información del video: {e}", "error")
             self.video_info = None
         finally:
             self.current_process = None
@@ -589,20 +746,25 @@ class YT_DLP_GUI(ctk.CTk):
             "HYWenHei-85W": ["Genshin Impact", "原神"]
         }
         
-        self.log_message(f"\nBuscando fuente para el título: '{title}'", "info")
+        self.log_message(f"Buscando fuente para el título: '{title}'", "info")
         for font, keywords in font_config.items():
             if any(keyword in title for keyword in keywords):
                 self.log_message(f"Fuente encontrada: {font}", "info")
                 return font
         self.log_message("No se detectó un juego específico. Se usará fuente por defecto.", "warning")
         return None
-    
+
     def fetch_external_sub_info_thread(self):
         """Inicia un hilo para obtener información de subtítulos externos"""
-        url = self.sub_external_url_entry.get()
+        url = self.sub_external_url_entry.get().strip()
         if not url:
             self.log_message("ERROR: Introduce un URL para los subtítulos externos.", "error")
             return
+            
+        if not self.validate_youtube_url(url):
+            self.log_message("ERROR: La URL de subtítulos externos no es válida.", "error")
+            return
+            
         self.log_message(f"Buscando subtítulos en: {url}", "info")
         self.set_ui_state(True)
         thread = threading.Thread(target=self._get_and_update_external_subs, args=(url,), daemon=True)
@@ -612,19 +774,32 @@ class YT_DLP_GUI(ctk.CTk):
         """Obtiene y actualiza información de subtítulos externos"""
         try:
             command = ["yt-dlp", "--dump-json", "--no-warnings", url]
-            self.current_process = subprocess.run(command, capture_output=True, text=True, check=True, 
-                                                encoding='utf-8', startupinfo=self._get_startup_info())
+            self.current_process = subprocess.run(
+                command, 
+                capture_output=True, 
+                text=True, 
+                check=True, 
+                encoding='utf-8', 
+                startupinfo=self._get_startup_info(),
+                timeout=30
+            )
             sub_info = json.loads(self.current_process.stdout)
             self.after(0, self._update_external_subs_menu, sub_info)
+        except subprocess.TimeoutExpired:
+            self.log_message("Error: Tiempo de espera agotado al obtener info de subtítulos", "error")
+        except subprocess.CalledProcessError as e:
+            self.log_message(f"Error en yt-dlp: {e.stderr if e.stderr else str(e)}", "error")
+        except json.JSONDecodeError as e:
+            self.log_message(f"Error al parsear info de subtítulos: {e}", "error")
         except Exception as e:
-            self.log_message(f"Error al obtener info de subtítulos: {e}", "error")
+            self.log_message(f"Error inesperado al obtener info de subtítulos: {e}", "error")
         finally:
             self.current_process = None
             if self.winfo_exists():
                 self.after(0, self.set_ui_state, False)
 
     def _update_external_subs_menu(self, sub_info):
-        """CORRECCIÓN: Actualiza el menú externo específico"""
+        """Actualiza el menú externo específico"""
         if not sub_info or "subtitles" not in sub_info or not sub_info["subtitles"]:
             self.log_message("ADVERTENCIA: El video externo no tiene subtítulos o el URL es inválido.", "warning")
             self.sub_lang_menu_external.configure(values=["-No encontrados-"], state="disabled")
@@ -645,19 +820,17 @@ class YT_DLP_GUI(ctk.CTk):
         return None
 
     def _run_command(self, command):
-        """Ejecuta un comando y registra la salida, manteniendo referencia al proceso"""
-        self.current_process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
-                                              text=True, encoding='utf-8', errors='replace', 
-                                              startupinfo=self._get_startup_info())
-        for line in iter(self.current_process.stdout.readline, ''):
-            level = "error" if "error" in line.lower() else "warning" if "warning" in line.lower() else "info"
-            self.log_message(line.strip(), level)
-        
-        return_code = self.current_process.wait()
-        self.current_process = None
-        
-        if return_code != 0: 
-            raise subprocess.CalledProcessError(return_code, command)
+        """Ejecuta un comando usando el context manager para manejo seguro"""
+        with self.managed_process(command) as process:
+            for line in iter(process.stdout.readline, ''):
+                if line:
+                    level = "error" if "error" in line.lower() else "warning" if "warning" in line.lower() else "info"
+                    self.log_message(line.strip(), level)
+            
+            return_code = process.wait()
+            
+            if return_code != 0: 
+                raise subprocess.CalledProcessError(return_code, command)
 
     def download_and_process_video(self, video_url, audio_info, sub_info, subtitle_options, font_name, final_video_name):
         original_dir = os.getcwd()
@@ -684,7 +857,6 @@ class YT_DLP_GUI(ctk.CTk):
             self._combine_files(temp_files, srt_file_to_use, subtitle_options, font_name, final_video_name)
             
             self.log_message(f"\n¡PROCESO COMPLETADO! Video guardado en:\n'{final_video_name}'", "success")
-
         except Exception as e:
             self.log_message(f"\nERROR DURANTE EL PROCESO: {e}", "error")
         finally:
@@ -697,7 +869,6 @@ class YT_DLP_GUI(ctk.CTk):
         """Descarga video y audio por separado"""
         self.log_message(f"\n--- Descargando video ---", "info")
         self._run_command(["yt-dlp", "-f", "bestvideo[vcodec^=avc][ext=mp4]", "-o", temp_files['video'], video_url])
-
         self.log_message(f"\n--- Descargando audio ---", "info")
         self._run_command(["yt-dlp", "-f", "bestaudio[ext=m4a]", "-o", temp_files['audio'], audio_url])
 
@@ -726,15 +897,12 @@ class YT_DLP_GUI(ctk.CTk):
             cmd.append(sub_url_source)
             
             try:
-                # self._run_command(cmd)
-                # return self._find_and_rename_srt_file(sub_lang, temp_srt_file)
                 os.makedirs("temp_subs_dir", exist_ok=True)
                 self._run_command(cmd + ["-P", "temp_subs_dir"])
                 return self._find_and_rename_srt_file(sub_lang, temp_srt_file, "temp_subs_dir")
             except Exception as e:
                 self.log_message(f"Fallo en la descarga de subtítulos: {e}", "error")
                 return None
-
         return None
 
     def _find_and_rename_srt_file(self, sub_lang, temp_srt_file, search_dir="."):
@@ -762,7 +930,14 @@ class YT_DLP_GUI(ctk.CTk):
                 if search_dir != ".":
                     shutil.rmtree(search_dir, ignore_errors=True)
                 
+                self.log_message(f"Subtítulos encontrados y procesados: {os.path.basename(selected_srt)}", "success")
                 return temp_srt_file
+        
+        # Return explícito cuando no encuentra archivos
+        self.log_message(f"ADVERTENCIA: No se encontraron subtítulos para '{sub_lang}'", "warning")
+        if search_dir != ".":
+            shutil.rmtree(search_dir, ignore_errors=True)
+        return None
 
     def _combine_files(self, temp_files, srt_file_to_use, subtitle_options, font_name, final_video_name):
         """Combina archivos de video, audio y subtítulos con las opciones especificadas"""
@@ -802,7 +977,7 @@ class YT_DLP_GUI(ctk.CTk):
         
         ffmpeg_cmd.append(final_video_name)
         self._run_command(ffmpeg_cmd)
-    
+
     def _cleanup_temp_files(self):
         """Limpia de forma segura los archivos y directorios temporales."""
         self.log_message("\nLimpiando archivos temporales...", "info")
@@ -832,12 +1007,11 @@ class YT_DLP_GUI(ctk.CTk):
             self.log_message("No se encontraron elementos temporales para limpiar.", "info")
 
     # --- Variables para Cargar, Guardar y Cerrar ruta de salida ---
-
     def _load_config(self):
         """Carga la configuración desde config.json si existe."""
         try:
             if os.path.exists(self.config_file):
-                with open(self.config_file, 'r') as f:
+                with open(self.config_file, 'r', encoding='utf-8') as f:
                     config = json.load(f)
                     self.last_output_dir = config.get("last_output_dir", "")
                     self.log_message("Configuración anterior cargada.", "info")
@@ -851,8 +1025,8 @@ class YT_DLP_GUI(ctk.CTk):
             current_path = self.dir_entry.get()
             if current_path: # Solo guarda si hay algo en el campo
                 config = {"last_output_dir": current_path}
-                with open(self.config_file, 'w') as f:
-                    json.dump(config, f, indent=4)
+                with open(self.config_file, 'w', encoding='utf-8') as f:
+                    json.dump(config, f, indent=4, ensure_ascii=False)
                 self.log_message("Configuración guardada.", "info")
         except IOError as e:
             self.log_message(f"No se pudo guardar la configuración: {e}", "error")
