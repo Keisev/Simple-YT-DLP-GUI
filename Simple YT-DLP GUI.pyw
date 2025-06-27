@@ -12,8 +12,11 @@ import threading
 import signal
 
 # --- CHANGELOG ---
-# v3.5
 
+# v3.5.1
+# - Ahora todos los videos se descargarán en códec h.264 (avc)
+
+# v3.5
 # - Corregido error al insertar subtítulos desde un archivo local: El programa ya no validará el idioma de los subtítulos si se selecciona un archivo local.
 # - El programa ya no elimina todos los archivos .srt en el directorio del script
 # - Eliminado código duplicado y redundante.
@@ -26,7 +29,7 @@ class YT_DLP_GUI(ctk.CTk):
         self.current_process = None
 
         # --- CONFIGURACIÓN DE LA VENTANA PRINCIPAL ---
-        self.title("Simple YT-DLP GUI v3.5")
+        self.title("Simple YT-DLP GUI v3.5.1")
         self.geometry("1100x680")
         self.resizable(True, True)
 
@@ -657,14 +660,12 @@ class YT_DLP_GUI(ctk.CTk):
             raise subprocess.CalledProcessError(return_code, command)
 
     def download_and_process_video(self, video_url, audio_info, sub_info, subtitle_options, font_name, final_video_name):
-        # Cambiar al directorio del script
         original_dir = os.getcwd()
         script_dir = os.path.dirname(os.path.abspath(__file__))
+        # Cambiar al directorio del script
         os.chdir(script_dir)
         
         try:
-            audio_type, audio_url = audio_info
-            sub_type, sub_lang, sub_url_source = sub_info
             temp_files = {
                 'video': "temp_video.mp4",
                 'audio': "temp_audio.m4a", 
@@ -672,12 +673,12 @@ class YT_DLP_GUI(ctk.CTk):
             }
             
             # Descargar video y audio
-            self._download_video_audio(video_url, audio_url, temp_files)
+            self._download_video_audio(video_url, audio_info[1], temp_files)
             
             # Procesar subtítulos si es necesario
             srt_file_to_use = None
-            if sub_type != "NONE":
-                srt_file_to_use = self._process_subtitles(sub_type, sub_lang, sub_url_source, temp_files['srt'])
+            if sub_info[0] != "NONE":
+                srt_file_to_use = self._process_subtitles(sub_info[0], sub_info[1], sub_info[2], temp_files['srt'])
             
             # Combinar archivos con las opciones de subtítulos
             self._combine_files(temp_files, srt_file_to_use, subtitle_options, font_name, final_video_name)
@@ -687,21 +688,22 @@ class YT_DLP_GUI(ctk.CTk):
         except Exception as e:
             self.log_message(f"\nERROR DURANTE EL PROCESO: {e}", "error")
         finally:
+            self._cleanup_temp_files()
             os.chdir(original_dir)
-            self._cleanup_temp_files(script_dir)
             if self.winfo_exists(): 
                 self.after(0, self.set_ui_state, False)
 
     def _download_video_audio(self, video_url, audio_url, temp_files):
         """Descarga video y audio por separado"""
         self.log_message(f"\n--- Descargando video ---", "info")
-        self._run_command(["yt-dlp", "-f", "bestvideo[ext=mp4]", "-o", temp_files['video'], video_url])
+        self._run_command(["yt-dlp", "-f", "bestvideo[vcodec^=avc][ext=mp4]", "-o", temp_files['video'], video_url])
 
         self.log_message(f"\n--- Descargando audio ---", "info")
         self._run_command(["yt-dlp", "-f", "bestaudio[ext=m4a]", "-o", temp_files['audio'], audio_url])
 
     def _process_subtitles(self, sub_type, sub_lang, sub_url_source, temp_srt_file):
         """Procesa los subtítulos según el tipo especificado"""
+        # CASO 1: Usar un archivo local
         if sub_type == "EXTERNAL" and self.local_srt_path and os.path.exists(self.local_srt_path):
             self.log_message(f"\n--- Usando subtítulo local ---", "info")
             try:
@@ -711,7 +713,8 @@ class YT_DLP_GUI(ctk.CTk):
             except Exception as e:
                 self.log_message(f"Error al copiar el archivo de subtítulos local: {e}", "error")
                 return None
-        
+
+        # CASO 2: Descargar desde la web
         elif sub_lang:
             self.log_message(f"\n--- Descargando subtítulos ({sub_type}: {sub_lang}) ---", "info")
             cmd = ["yt-dlp", "--skip-download", "--convert-subs", "srt", "--sub-langs", sub_lang]
@@ -723,34 +726,43 @@ class YT_DLP_GUI(ctk.CTk):
             cmd.append(sub_url_source)
             
             try:
-                self._run_command(cmd)
-                return self._find_and_rename_srt_file(sub_lang, temp_srt_file)
+                # self._run_command(cmd)
+                # return self._find_and_rename_srt_file(sub_lang, temp_srt_file)
+                os.makedirs("temp_subs_dir", exist_ok=True)
+                self._run_command(cmd + ["-P", "temp_subs_dir"])
+                return self._find_and_rename_srt_file(sub_lang, temp_srt_file, "temp_subs_dir")
             except Exception as e:
                 self.log_message(f"Fallo en la descarga de subtítulos: {e}", "error")
                 return None
-        
+
         return None
 
-    def _find_and_rename_srt_file(self, sub_lang, temp_srt_file):
-        """Busca y renombra el archivo SRT descargado"""
-        possible_srt_files = []
-        patterns = [f"*.{sub_lang}*.srt", f"*.{sub_lang.split('-')[0]}*.srt", "*.srt"]
+    def _find_and_rename_srt_file(self, sub_lang, temp_srt_file, search_dir="."):
+        """Busca y renombra el archivo SRT en un directorio específico"""
+        patterns = [
+            f"*.{sub_lang}*.srt",
+            f"*.{sub_lang.split('-')[0]}*.srt",
+            "*.srt"
+        ]
         
+        # Buscar solo en el directorio especificado
         for pattern in patterns:
-            possible_srt_files.extend(glob.glob(pattern))
-        
-        if possible_srt_files:
-            possible_srt_files = sorted(set(possible_srt_files), key=len)
-            selected_srt = possible_srt_files[0]
-            shutil.move(selected_srt, temp_srt_file)
-            self.log_message(f"Subtítulos encontrados: {selected_srt} -> {temp_srt_file}", "success")
-            return temp_srt_file
-        else:
-            self.log_message(f"ADVERTENCIA: No se pudo encontrar el archivo de subtítulos '{sub_lang}'.", "warning")
-            all_srt = glob.glob("*.srt")
-            if all_srt:
-                self.log_message(f"Archivos .srt encontrados: {', '.join(all_srt)}", "info")
-            return None
+            full_pattern = os.path.join(search_dir, pattern)
+            possible_srt_files = glob.glob(full_pattern)
+            
+            if possible_srt_files:
+                # Ordenar por fecha de modificación (más reciente primero)
+                possible_srt_files.sort(key=os.path.getmtime, reverse=True)
+                selected_srt = possible_srt_files[0]
+                
+                # Mover y renombrar
+                shutil.move(selected_srt, temp_srt_file)
+                
+                # Limpiar directorio temporal
+                if search_dir != ".":
+                    shutil.rmtree(search_dir, ignore_errors=True)
+                
+                return temp_srt_file
 
     def _combine_files(self, temp_files, srt_file_to_use, subtitle_options, font_name, final_video_name):
         """Combina archivos de video, audio y subtítulos con las opciones especificadas"""
@@ -790,23 +802,34 @@ class YT_DLP_GUI(ctk.CTk):
         
         ffmpeg_cmd.append(final_video_name)
         self._run_command(ffmpeg_cmd)
-            
-    def _cleanup_temp_files(self, script_dir):
-        """Limpia archivos temporales en el directorio del script"""
-        original_dir = os.getcwd()
-        try:
-            os.chdir(script_dir)
-            self.log_message("\nLimpiando archivos temporales...", "info")
-            patterns = ["temp_video.mp4", "temp_audio.m4a", "temp_subs.srt"]
-            for pattern in patterns:
-                for f in glob.glob(pattern):
-                    try:
-                        os.remove(f)
-                        self.log_message(f"  Eliminado: {f}", "info")
-                    except OSError as e:
-                        self.log_message(f"Error al eliminar {f}: {e}", "warning")
-        finally:
-            os.chdir(original_dir)
+    
+    def _cleanup_temp_files(self):
+        """Limpia de forma segura los archivos y directorios temporales."""
+        self.log_message("\nLimpiando archivos temporales...", "info")
+        
+        # 1. Limpiar archivos individuales que empiezan con "temp_"
+        temp_files_pattern = "temp_*.*"
+        files_to_delete = glob.glob(temp_files_pattern)
+        for f in files_to_delete:
+            try:
+                os.remove(f)
+                self.log_message(f"  Eliminado archivo: {f}", "info")
+            except OSError as e:
+                self.log_message(f"Error al eliminar archivo {f}: {e}", "warning")
+
+        # 2. Limpiar el directorio temporal de subtítulos si existe
+        temp_dir = "temp_subs_dir"
+        if os.path.isdir(temp_dir):
+            try:
+                # Usamos shutil.rmtree para borrar directorios y su contenido
+                shutil.rmtree(temp_dir)
+                self.log_message(f"  Eliminado directorio: {temp_dir}", "info")
+            except OSError as e:
+                self.log_message(f"Error al eliminar directorio {temp_dir}: {e}", "warning")
+
+        # Mensaje final si no se encontró nada que limpiar
+        if not files_to_delete and not os.path.isdir(temp_dir):
+            self.log_message("No se encontraron elementos temporales para limpiar.", "info")
 
     # --- Variables para Cargar, Guardar y Cerrar ruta de salida ---
 
